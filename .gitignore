@@ -45,3 +45,10 @@ coverage/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# terraform
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/.terraform.lock.hcl
+infra/tfplan

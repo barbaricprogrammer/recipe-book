@@ -1,0 +1,172 @@
+name: Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra.yml"
+
+permissions:
+  contents: read
+  id-token: write # Required for Azure OIDC login
+  pull-requests: write # Required for PR comments
+
+env:
+  TF_VERSION: "1.9"
+  WORKING_DIR: infra
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  Terraform Plan — runs on every push & PR
+  # ------------------------------------------------------------------ #
+  plan:
+    name: "Plan (${{ matrix.environment }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [staging, prod]
+    environment: ${{ matrix.environment }}
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=grocery-planner-${{ matrix.environment }}.tfstate"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -var-file="environments/${{ matrix.environment }}.tfvars" -out=tfplan -no-color
+        continue-on-error: true
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan — \`${{ matrix.environment }}\`
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Triggered by @${{ github.actor }} in ${{ github.sha }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output.substring(0, 65536)
+            });
+
+      - name: Fail on plan error
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload Plan Artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 5
+
+  # ------------------------------------------------------------------ #
+  #  Terraform Apply — only on push to main (staging auto, prod gated)
+  # ------------------------------------------------------------------ #
+  apply-staging:
+    name: "Apply (staging)"
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=grocery-planner-staging.tfstate"
+
+      - name: Terraform Apply
+        run: terraform apply -var-file="environments/staging.tfvars" -auto-approve
+
+  apply-prod:
+    name: "Apply (prod)"
+    needs: [plan, apply-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production # GitHub environment with required reviewers
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=grocery-planner-prod.tfstate"
+
+      - name: Terraform Apply
+        run: terraform apply -var-file="environments/prod.tfvars" -auto-approve
